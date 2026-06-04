@@ -34,6 +34,8 @@ def parse_args():
     p.add_argument("--w-mv", type=float, default=1.0, help="Multi-view gen loss weight")
     p.add_argument("--w-render", type=float, default=0.5, help="Rendered RGB loss weight")
     p.add_argument("--w-ccm", type=float, default=0.3, help="CCM geometry loss weight")
+    p.add_argument("--w-mask", type=float, default=0.0,
+                   help="Silhouette/mask loss weight (alpha vs mask). Pakai untuk data real tanpa CCM.")
     p.add_argument("--save-dir", type=str, default="checkpoints")
     p.add_argument("--tag", type=str, default="run",
                    help="Tag untuk checkpoint (misal: 'full', 'no_feedback')")
@@ -55,6 +57,7 @@ def compute_losses(outputs, batch, args):
     pred_target = o["pred_target"]     # [B, N-1, 3, H, W]
     rendered_rgb = o["rendered_rgb"]   # [B, N, 3, H, W]
     rendered_ccm = o["rendered_ccm"]   # [B, N, 3, H, W]
+    alpha = o["alpha"]                 # [B, N, 1, H, W]
 
     # Multi-view generator loss (L1 + 0.5 * L2)
     loss_mv = F.l1_loss(pred_target, target_rgb) + 0.5 * F.mse_loss(pred_target, target_rgb)
@@ -83,13 +86,21 @@ def compute_losses(outputs, batch, args):
     else:
         losses["ccm"] = 0.0
 
+    # Silhouette loss: rendered alpha vs ground-truth mask (geometri untuk data real)
+    if args.joint and args.w_mask > 0:
+        loss_mask = F.binary_cross_entropy(alpha.clamp(1e-6, 1 - 1e-6), all_mask)
+        losses["mask"] = loss_mask.item()
+        total = total + args.w_mask * loss_mask
+    else:
+        losses["mask"] = 0.0
+
     losses["total"] = total.item()
     return total, losses
 
 
 def train_one_epoch(model, loader, optimizer, device, args, epoch):
     model.train()
-    running = {"mv": 0.0, "render": 0.0, "ccm": 0.0, "total": 0.0}
+    running = {"mv": 0.0, "render": 0.0, "ccm": 0.0, "mask": 0.0, "total": 0.0}
     n = 0
     pbar = tqdm(loader, desc=f"[Ep {epoch}] train", leave=False)
     for batch in pbar:
@@ -126,6 +137,7 @@ def train_one_epoch(model, loader, optimizer, device, args, epoch):
             mv=f"{parts['mv']:.3f}",
             rnd=f"{parts['render']:.3f}",
             ccm=f"{parts['ccm']:.3f}",
+            msk=f"{parts['mask']:.3f}",
             tot=f"{parts['total']:.3f}",
         )
     return {k: v / max(1, n) for k, v in running.items()}
@@ -134,7 +146,7 @@ def train_one_epoch(model, loader, optimizer, device, args, epoch):
 @torch.no_grad()
 def validate(model, loader, device, args, epoch):
     model.eval()
-    running = {"mv": 0.0, "render": 0.0, "ccm": 0.0, "total": 0.0}
+    running = {"mv": 0.0, "render": 0.0, "ccm": 0.0, "mask": 0.0, "total": 0.0}
     n = 0
     pbar = tqdm(loader, desc=f"[Ep {epoch}] val  ", leave=False)
     for batch in pbar:
@@ -190,8 +202,8 @@ def main():
         va = validate(model, val_loader, device, args, epoch)
         elapsed = time.time() - t0
         print(f"Epoch {epoch}/{args.epochs} "
-              f"| train: mv={tr['mv']:.3f} rnd={tr['render']:.3f} ccm={tr['ccm']:.3f} tot={tr['total']:.3f} "
-              f"| val: mv={va['mv']:.3f} rnd={va['render']:.3f} ccm={va['ccm']:.3f} tot={va['total']:.3f} "
+              f"| train: mv={tr['mv']:.3f} rnd={tr['render']:.3f} ccm={tr['ccm']:.3f} msk={tr['mask']:.3f} tot={tr['total']:.3f} "
+              f"| val: mv={va['mv']:.3f} rnd={va['render']:.3f} ccm={va['ccm']:.3f} msk={va['mask']:.3f} tot={va['total']:.3f} "
               f"| {elapsed:.1f}s")
         history.append({"epoch": epoch, "train": tr, "val": va})
 

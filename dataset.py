@@ -31,6 +31,7 @@ class MultiViewDataset(Dataset):
                 f"No objects in '{root_dir}'. Run generate_synthetic_dataset.py first."
             )
 
+        # resizw
         self.img_transform = transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
@@ -65,24 +66,47 @@ class MultiViewDataset(Dataset):
             ).squeeze(0)
         return ccm_t
 
+    def _load_mask(self, path, apply_flip):
+        """Load mask [H, W] -> tensor [1, H, W] di {0,1}, resized ke img_size."""
+        m = np.load(path).astype(np.float32)
+        if m.ndim == 3:
+            m = m[..., 0]
+        if apply_flip:
+            m = np.ascontiguousarray(m[:, ::-1])
+        m_t = torch.from_numpy(m).unsqueeze(0)  # [1, H, W]
+        if m_t.shape[-1] != self.img_size:
+            m_t = torch.nn.functional.interpolate(
+                m_t.unsqueeze(0), size=(self.img_size, self.img_size),
+                mode="nearest",
+            ).squeeze(0)
+        return m_t
+
     def __getitem__(self, idx):
         obj_dir = self.object_dirs[idx]
         view_paths = sorted(glob.glob(os.path.join(obj_dir, "views", "view_*.png")))[:self.num_views]
         ccm_paths = sorted(glob.glob(os.path.join(obj_dir, "ccm", "view_*.npy")))[:self.num_views]
+        mask_paths = sorted(glob.glob(os.path.join(obj_dir, "mask", "view_*.npy")))[:self.num_views]
+        has_mask = len(mask_paths) >= self.num_views
 
         apply_flip = self.augment and (torch.rand(1).item() < 0.5)
 
-        rgbs, ccms = [], []
+        rgbs, ccms, masks = [], [], []
         for i in range(self.num_views):
             jitter = self.augment and (i == 0) and (torch.rand(1).item() < 0.5)
             rgbs.append(self._load_rgb(view_paths[i], apply_flip, jitter))
             ccms.append(self._load_ccm(ccm_paths[i], apply_flip))
+            if has_mask:
+                masks.append(self._load_mask(mask_paths[i], apply_flip))
 
         rgb_t = torch.stack(rgbs, dim=0)   # [N, 3, H, W]
         ccm_t = torch.stack(ccms, dim=0)   # [N, 3, H, W]
 
-        # Foreground mask dari ccm: pixel dengan norm > 0 = foreground
-        mask = (ccm_t.abs().sum(dim=1, keepdim=True) > 1e-5).float()  # [N, 1, H, W]
+        if has_mask:
+            # Mask siluet eksplisit (data real tanpa CCM)
+            mask = torch.stack(masks, dim=0)                             # [N, 1, H, W]
+        else:
+            # Foreground mask dari ccm: pixel dengan norm > 0 = foreground
+            mask = (ccm_t.abs().sum(dim=1, keepdim=True) > 1e-5).float()  # [N, 1, H, W]
 
         # Camera poses
         poses = np.load(os.path.join(obj_dir, "camera_poses.npy"))[:self.num_views]
