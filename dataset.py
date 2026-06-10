@@ -148,9 +148,11 @@ def build_dataloaders(
     train_ds = torch.utils.data.Subset(full_train, list(train_indices))
     val_ds = torch.utils.data.Subset(full_val, list(val_indices))
 
+    # drop_last hanya kalau cukup data; cegah train loader kosong di dataset kecil
+    drop_last = n_train >= batch_size
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, drop_last=True,
+        num_workers=num_workers, pin_memory=True, drop_last=drop_last,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,

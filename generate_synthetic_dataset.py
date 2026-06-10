@@ -1,3 +1,4 @@
+import argparse
 import os
 import numpy as np
 from PIL import Image
@@ -167,6 +168,17 @@ def generate_object(obj_id, output_dir):
 
 
 def main():
+    global NUM_OBJECTS, NUM_VIEWS, IMG_SIZE, OUTPUT_DIR
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--num-objects", type=int, default=NUM_OBJECTS, help="Jumlah objek (default 60).")
+    ap.add_argument("--num-views", type=int, default=NUM_VIEWS, help="View per objek (default 8).")
+    ap.add_argument("--img-size", type=int, default=IMG_SIZE, help="Resolusi gambar (default 128).")
+    ap.add_argument("--output", default=OUTPUT_DIR, help="Folder output.")
+    args = ap.parse_args()
+    NUM_OBJECTS, NUM_VIEWS, IMG_SIZE, OUTPUT_DIR = (
+        args.num_objects, args.num_views, args.img_size, args.output
+    )
+
     print(f"Generating {NUM_OBJECTS} objects x {NUM_VIEWS} views @ {IMG_SIZE}x{IMG_SIZE}")
     print("Each view: RGB + depth + CCM + camera pose")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
