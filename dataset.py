@@ -28,7 +28,7 @@ class MultiViewDataset(Dataset):
         )
         if len(self.object_dirs) == 0:
             raise RuntimeError(
-                f"No objects in '{root_dir}'. Run generate_synthetic_dataset.py first."
+                f"No objects in '{root_dir}'. Run prepare_shrec.py first."
             )
 
         # resizw
