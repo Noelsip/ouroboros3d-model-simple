@@ -66,11 +66,15 @@ class ViewHead(nn.Module):
             conv_block(latent_ch, latent_ch),
         )
 
-    def forward(self, shared):
+    def forward(self, shared, pose_feat=None):
+        """pose_feat (opsional): [B, V, C] embedding pose target per view -> ditambahkan
+        ke view embedding supaya tiap slot view "tahu" sudut kamera targetnya."""
         B, C, H, W = shared.shape
         V = self.num_views
         shared_exp = shared.unsqueeze(1).expand(B, V, C, H, W)
         embed_exp = self.view_embed.unsqueeze(0).expand(B, V, C, H, W)
+        if pose_feat is not None:
+            embed_exp = embed_exp + pose_feat.reshape(B, V, C, 1, 1)
         cat = torch.cat([shared_exp, embed_exp], dim=2).reshape(B * V, 2 * C, H, W)
         out = self.mix(cat)
         return out.reshape(B, V, C, H, W)
@@ -129,23 +133,45 @@ class MultiViewGenerator(nn.Module):
     cond_image [+ optional feedback] -> prediksi V target view.
     """
 
-    def __init__(self, num_target_views=7, base_ch=32, use_feedback=True, img_size=128):
+    def __init__(self, num_target_views=7, base_ch=32, use_feedback=True, img_size=128,
+                 use_pose_cond=True):
         super().__init__()
         self.num_target_views = num_target_views
         self.use_feedback = use_feedback
+        self.use_pose_cond = use_pose_cond
+        latent_ch = base_ch * 8
         # Encoder downsample 4x (16x spatial reduction: stride=2 x 4 stages)
         spatial = max(1, img_size // 16)
         self.encoder = Encoder(in_ch=3, base_ch=base_ch)
-        self.view_head = ViewHead(num_target_views, latent_ch=base_ch * 8, spatial=spatial)
+        self.view_head = ViewHead(num_target_views, latent_ch=latent_ch, spatial=spatial)
         self.decoder = Decoder(out_ch=3, base_ch=base_ch)
 
         if use_feedback:
             self.rgb_fb_encoder = FeedbackEncoder(in_ch=3, base_ch=base_ch)
             self.ccm_fb_encoder = FeedbackEncoder(in_ch=3, base_ch=base_ch)
 
-    def forward(self, cond_image, rgb_feedback=None, ccm_feedback=None):
+        if use_pose_cond:
+            # Encode pose target RELATIF terhadap conditioning view (9 rot + 3 trans = 12)
+            # -> embedding per view. Bikin generator pose-aware (tidak averaging jadi blob).
+            self.pose_mlp = nn.Sequential(
+                nn.Linear(12, latent_ch), nn.SiLU(),
+                nn.Linear(latent_ch, latent_ch),
+            )
+
+    def _pose_feat(self, poses):
+        """poses [B, N, 4, 4] (view 0 = conditioning) -> pose_feat [B, N-1, latent_ch]
+        memakai pose target relatif ke kamera conditioning (invarian orientasi global)."""
+        B, N = poses.shape[:2]
+        cond_inv = torch.inverse(poses[:, 0:1])              # [B, 1, 4, 4]
+        rel = torch.matmul(cond_inv.expand(B, N - 1, 4, 4), poses[:, 1:])  # [B, V, 4, 4]
+        R = rel[..., :3, :3].reshape(B, N - 1, 9)
+        t = rel[..., :3, 3]                                  # [B, V, 3]
+        return self.pose_mlp(torch.cat([R, t], dim=-1))      # [B, V, latent_ch]
+
+    def forward(self, cond_image, poses=None, rgb_feedback=None, ccm_feedback=None):
         """
         cond_image:   [B, 3, H, W]
+        poses:        [B, N, 4, 4] semua pose kamera (view 0 = conditioning) -> pose-cond
         rgb_feedback: [B, 3, H, W] atau None (rendered rgb dari reconstruction step sebelumnya)
         ccm_feedback: [B, 3, H, W] atau None
         """
@@ -155,8 +181,12 @@ class MultiViewGenerator(nn.Module):
             ccm_feats = self.ccm_fb_encoder(ccm_feedback)
             feedback_feats = tuple(r + c for r, c in zip(rgb_feats, ccm_feats))
 
+        pose_feat = None
+        if self.use_pose_cond and (poses is not None):
+            pose_feat = self._pose_feat(poses)
+
         shared, _ = self.encoder(cond_image, feedback_feats=feedback_feats)
-        view_latents = self.view_head(shared)           # [B, V, C, 8, 8]
+        view_latents = self.view_head(shared, pose_feat=pose_feat)   # [B, V, C, 8, 8]
         B, V, C, H, W = view_latents.shape
         flat = view_latents.reshape(B * V, C, H, W)
         out = self.decoder(flat)                        # [B*V, 3, 128, 128]
@@ -370,18 +400,21 @@ class Ouroboros3D(nn.Module):
         num_gaussians=512,
         img_size=128,
         use_feedback=True,
+        use_pose_cond=True,
     ):
         super().__init__()
         self.num_views = num_views
         self.num_target_views = num_views - 1
         self.img_size = img_size
         self.use_feedback = use_feedback
+        self.use_pose_cond = use_pose_cond
 
         self.mv_generator = MultiViewGenerator(
             num_target_views=self.num_target_views,
             base_ch=base_ch,
             use_feedback=use_feedback,
             img_size=img_size,
+            use_pose_cond=use_pose_cond,
         )
         self.reconstructor = GaussianPredictor(
             num_gaussians=num_gaussians,
@@ -408,6 +441,7 @@ class Ouroboros3D(nn.Module):
             # 1) Generate multi-view
             pred_target = self.mv_generator(
                 cond_image,
+                poses=poses,
                 rgb_feedback=rgb_feedback,
                 ccm_feedback=ccm_feedback,
             )   # [B, V=N-1, 3, H, W]

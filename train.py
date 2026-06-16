@@ -21,6 +21,8 @@ def parse_args():
                    help="Resolusi image. 64 untuk demo cepat, 128 untuk kualitas lebih baik.")
     p.add_argument("--num-views", type=int, default=8)
     p.add_argument("--num-gaussians", type=int, default=128)
+    p.add_argument("--base-ch", type=int, default=32,
+                   help="Lebar channel dasar model. Naikkan (48/64) untuk kapasitas lebih.")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--grad-clip", type=float, default=1.0)
     # Ablation toggles
@@ -28,8 +30,9 @@ def parse_args():
                    help="Aktifkan 3D-aware feedback (full Ouroboros3D).")
     p.add_argument("--joint", action="store_true",
                    help="Joint train G + F_θ. Default: only train F_θ.")
-    p.add_argument("--self-cond-prob", type=float, default=0.5,
-                   help="Prob. self-conditioning saat training (paper: 0.5).")
+    p.add_argument("--train-steps", type=int, default=2,
+                   help="Jumlah recursive step saat training (hanya jika --use-feedback). "
+                        "2 = step-1 tanpa feedback + step-2 pakai feedback, gradien lewat loop.")
     # Loss weights
     p.add_argument("--w-mv", type=float, default=1.0, help="Multi-view gen loss weight")
     p.add_argument("--w-render", type=float, default=0.5, help="Rendered RGB loss weight")
@@ -42,18 +45,13 @@ def parse_args():
     return p.parse_args()
 
 
-def compute_losses(outputs, batch, args):
-    """
-    outputs: list dict hasil model (tiap elemen = 1 recursive step)
-    batch:   dict dari dataloader
-    """
+def _step_losses(o, batch, args):
+    """Loss untuk SATU recursive step. Return (total_tensor, dict_float)."""
     target_rgb = batch["target_rgb"]   # [B, N-1, 3, H, W]
     all_rgb = batch["all_rgb"]         # [B, N, 3, H, W]
     all_ccm = batch["all_ccm"]         # [B, N, 3, H, W]
     all_mask = batch["all_mask"]       # [B, N, 1, H, W]
 
-    # supervise step terakhir (biar bisa multi-step di inference)
-    o = outputs[-1]
     pred_target = o["pred_target"]     # [B, N-1, 3, H, W]
     rendered_rgb = o["rendered_rgb"]   # [B, N, 3, H, W]
     rendered_ccm = o["rendered_ccm"]   # [B, N, 3, H, W]
@@ -61,11 +59,9 @@ def compute_losses(outputs, batch, args):
 
     # Multi-view generator loss (L1 + 0.5 * L2)
     loss_mv = F.l1_loss(pred_target, target_rgb) + 0.5 * F.mse_loss(pred_target, target_rgb)
-
     losses = {"mv": loss_mv.item()}
     total = args.w_mv * loss_mv
 
-    # Rendered RGB loss (hanya kalau joint training dan w_render > 0)
     if args.joint and args.w_render > 0:
         loss_render = F.l1_loss(rendered_rgb, all_rgb)
         losses["render"] = loss_render.item()
@@ -73,10 +69,8 @@ def compute_losses(outputs, batch, args):
     else:
         losses["render"] = 0.0
 
-    # CCM geometry loss (hanya di daerah foreground -- mask)
     if args.joint and args.w_ccm > 0:
         mask_3ch = all_mask.expand_as(all_ccm)
-        # Clamp ground truth CCM ke [-1, 1] karena range dataset bisa sedikit lebih (interpolasi)
         gt_ccm_clamped = all_ccm.clamp(-1.0, 1.0)
         loss_ccm = (F.l1_loss(rendered_ccm * mask_3ch,
                               gt_ccm_clamped * mask_3ch, reduction="sum")
@@ -86,7 +80,6 @@ def compute_losses(outputs, batch, args):
     else:
         losses["ccm"] = 0.0
 
-    # Silhouette loss: rendered alpha vs ground-truth mask (geometri untuk data real)
     if args.joint and args.w_mask > 0:
         loss_mask = F.binary_cross_entropy(alpha.clamp(1e-6, 1 - 1e-6), all_mask)
         losses["mask"] = loss_mask.item()
@@ -94,6 +87,25 @@ def compute_losses(outputs, batch, args):
     else:
         losses["mask"] = 0.0
 
+    return total, losses
+
+
+def compute_losses(outputs, batch, args):
+    """
+    outputs: list dict hasil model (tiap elemen = 1 recursive step).
+    Supervisi DIRATA-RATA atas SEMUA step -> step-1 (tanpa feedback) maupun step-2
+    (dengan feedback) sama-sama dilatih, dan gradien mengalir lewat loop feedback.
+    """
+    n = len(outputs)
+    total = 0.0
+    acc = {"mv": 0.0, "render": 0.0, "ccm": 0.0, "mask": 0.0}
+    for o in outputs:
+        t, parts = _step_losses(o, batch, args)
+        total = total + t
+        for k in acc:
+            acc[k] += parts[k]
+    total = total / n
+    losses = {k: v / n for k, v in acc.items()}
     losses["total"] = total.item()
     return total, losses
 
@@ -112,18 +124,10 @@ def train_one_epoch(model, loader, optimizer, device, args, epoch):
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Self-conditioning with prob p
-        prev_feedback = None
-        if args.use_feedback and (torch.rand(1).item() < args.self_cond_prob):
-            with torch.no_grad():
-                dry = model(cond_image, poses, num_recursive_steps=1)
-                prev_feedback = {
-                    "rgb": dry[0]["rendered_rgb"][:, 0].detach(),
-                    "ccm": dry[0]["rendered_ccm"][:, 0].detach(),
-                }
-
-        outputs = model(cond_image, poses, num_recursive_steps=1,
-                        prev_feedback=prev_feedback)
+        # Recursive training: step-1 tanpa feedback, step-2 pakai render step-1 sbg feedback.
+        # Gradien mengalir lewat loop -> feedback encoder ikut terlatih (akar C).
+        n_steps = args.train_steps if args.use_feedback else 1
+        outputs = model(cond_image, poses, num_recursive_steps=n_steps)
         loss, parts = compute_losses(outputs, batch, args)
 
         loss.backward()
@@ -152,7 +156,8 @@ def validate(model, loader, device, args, epoch):
     for batch in pbar:
         batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                  for k, v in batch.items()}
-        outputs = model(batch["cond_image"], batch["poses"], num_recursive_steps=1)
+        n_steps = args.train_steps if args.use_feedback else 1
+        outputs = model(batch["cond_image"], batch["poses"], num_recursive_steps=n_steps)
         _, parts = compute_losses(outputs, batch, args)
         for k, v in parts.items():
             running[k] += v
@@ -180,7 +185,7 @@ def main():
     print("\n[2/4] Building Ouroboros3D model...")
     model = Ouroboros3D(
         num_views=args.num_views,
-        base_ch=32,
+        base_ch=args.base_ch,
         num_gaussians=args.num_gaussians,
         img_size=args.img_size,
         use_feedback=args.use_feedback,
