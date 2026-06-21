@@ -133,11 +133,21 @@ class MultiViewGenerator(nn.Module):
     cond_image [+ optional feedback] -> prediksi V target view.
     """
 
-    def __init__(self, num_target_views=7, base_ch=32, use_feedback=True, img_size=128,
+    def __init__(self, num_target_views=7, base_ch=32, use_feedback=True,
+                 use_rgb_feedback=None, use_ccm_feedback=None, img_size=128,
                  use_pose_cond=True):
         super().__init__()
+        # use_rgb_feedback/use_ccm_feedback: kontrol terpisah utk ablasi (Tab. 2 paper:
+        # Joint Training x CCM Feedback x RGB Feedback). Default None -> ikut use_feedback
+        # (perilaku lama: keduanya nyala/mati bersamaan).
+        if use_rgb_feedback is None:
+            use_rgb_feedback = use_feedback
+        if use_ccm_feedback is None:
+            use_ccm_feedback = use_feedback
         self.num_target_views = num_target_views
-        self.use_feedback = use_feedback
+        self.use_rgb_feedback = use_rgb_feedback
+        self.use_ccm_feedback = use_ccm_feedback
+        self.use_feedback = use_rgb_feedback or use_ccm_feedback
         self.use_pose_cond = use_pose_cond
         latent_ch = base_ch * 8
         # Encoder downsample 4x (16x spatial reduction: stride=2 x 4 stages)
@@ -146,8 +156,9 @@ class MultiViewGenerator(nn.Module):
         self.view_head = ViewHead(num_target_views, latent_ch=latent_ch, spatial=spatial)
         self.decoder = Decoder(out_ch=3, base_ch=base_ch)
 
-        if use_feedback:
+        if use_rgb_feedback:
             self.rgb_fb_encoder = FeedbackEncoder(in_ch=3, base_ch=base_ch)
+        if use_ccm_feedback:
             self.ccm_fb_encoder = FeedbackEncoder(in_ch=3, base_ch=base_ch)
 
         if use_pose_cond:
@@ -175,11 +186,18 @@ class MultiViewGenerator(nn.Module):
         rgb_feedback: [B, 3, H, W] atau None (rendered rgb dari reconstruction step sebelumnya)
         ccm_feedback: [B, 3, H, W] atau None
         """
+        # Tiap modalitas feedback (RGB, CCM) bisa dipakai sendiri-sendiri atau gabungan
+        # (dijumlahkan per stage) -> dipakai utk ablasi terpisah seperti Tab. 2 paper.
+        feedback_parts = []
+        if self.use_rgb_feedback and (rgb_feedback is not None):
+            feedback_parts.append(self.rgb_fb_encoder(rgb_feedback))
+        if self.use_ccm_feedback and (ccm_feedback is not None):
+            feedback_parts.append(self.ccm_fb_encoder(ccm_feedback))
         feedback_feats = None
-        if self.use_feedback and (rgb_feedback is not None) and (ccm_feedback is not None):
-            rgb_feats = self.rgb_fb_encoder(rgb_feedback)
-            ccm_feats = self.ccm_fb_encoder(ccm_feedback)
-            feedback_feats = tuple(r + c for r, c in zip(rgb_feats, ccm_feats))
+        if feedback_parts:
+            feedback_feats = feedback_parts[0]
+            for extra in feedback_parts[1:]:
+                feedback_feats = tuple(a + b for a, b in zip(feedback_feats, extra))
 
         pose_feat = None
         if self.use_pose_cond and (poses is not None):
@@ -400,19 +418,28 @@ class Ouroboros3D(nn.Module):
         num_gaussians=512,
         img_size=128,
         use_feedback=True,
+        use_rgb_feedback=None,
+        use_ccm_feedback=None,
         use_pose_cond=True,
     ):
         super().__init__()
+        if use_rgb_feedback is None:
+            use_rgb_feedback = use_feedback
+        if use_ccm_feedback is None:
+            use_ccm_feedback = use_feedback
         self.num_views = num_views
         self.num_target_views = num_views - 1
         self.img_size = img_size
-        self.use_feedback = use_feedback
+        self.use_rgb_feedback = use_rgb_feedback
+        self.use_ccm_feedback = use_ccm_feedback
+        self.use_feedback = use_rgb_feedback or use_ccm_feedback
         self.use_pose_cond = use_pose_cond
 
         self.mv_generator = MultiViewGenerator(
             num_target_views=self.num_target_views,
             base_ch=base_ch,
-            use_feedback=use_feedback,
+            use_rgb_feedback=use_rgb_feedback,
+            use_ccm_feedback=use_ccm_feedback,
             img_size=img_size,
             use_pose_cond=use_pose_cond,
         )

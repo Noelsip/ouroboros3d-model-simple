@@ -27,7 +27,11 @@ def parse_args():
     p.add_argument("--grad-clip", type=float, default=1.0)
     # Ablation toggles
     p.add_argument("--use-feedback", action="store_true",
-                   help="Aktifkan 3D-aware feedback (full Ouroboros3D).")
+                   help="Aktifkan 3D-aware feedback penuh (RGB+CCM). Setara --use-rgb-feedback --use-ccm-feedback.")
+    p.add_argument("--use-rgb-feedback", action="store_true",
+                   help="Aktifkan feedback RGB saja (ablasi terpisah dari CCM, lihat Tab. 2 paper).")
+    p.add_argument("--use-ccm-feedback", action="store_true",
+                   help="Aktifkan feedback CCM saja (ablasi terpisah dari RGB, lihat Tab. 2 paper).")
     p.add_argument("--joint", action="store_true",
                    help="Joint train G + F_θ. Default: only train F_θ.")
     p.add_argument("--train-steps", type=int, default=2,
@@ -167,10 +171,16 @@ def validate(model, loader, device, args, epoch):
 
 def main():
     args = parse_args()
+    # Resolusi flag feedback: --use-feedback = shorthand utk RGB+CCM sekaligus.
+    # Disimpan balik ke args supaya konsisten di seluruh kode + tersimpan di checkpoint.
+    args.use_rgb_feedback = bool(args.use_feedback or args.use_rgb_feedback)
+    args.use_ccm_feedback = bool(args.use_feedback or args.use_ccm_feedback)
+    args.use_feedback = args.use_rgb_feedback or args.use_ccm_feedback
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Config: use_feedback={args.use_feedback}, joint={args.joint}, tag={args.tag}")
+    print(f"Config: use_feedback={args.use_feedback} (rgb={args.use_rgb_feedback}, "
+          f"ccm={args.use_ccm_feedback}), joint={args.joint}, tag={args.tag}")
 
     print("\n[1/4] Dataloaders...")
     train_loader, val_loader = build_dataloaders(
@@ -188,7 +198,8 @@ def main():
         base_ch=args.base_ch,
         num_gaussians=args.num_gaussians,
         img_size=args.img_size,
-        use_feedback=args.use_feedback,
+        use_rgb_feedback=args.use_rgb_feedback,
+        use_ccm_feedback=args.use_ccm_feedback,
     ).to(device)
     n = model.count_parameters()
     print(f"  params: {n:,} ({n/1e6:.2f}M)")
